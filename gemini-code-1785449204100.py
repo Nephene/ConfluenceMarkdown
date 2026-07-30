@@ -7,7 +7,7 @@ import requests
 import html2text
 
 # ==================== CONFIGURATION ====================
-CONFLUENCE_URL = "https://orangesharing.com"               # Confirmed Base URL
+CONFLUENCE_URL = "http"               # Confirmed Base URL
 START_PAGE_IDS = ["123456789"]                             # List of top-level Page IDs
 PERSONAL_ACCESS_TOKEN = "your-generated-pat-token-here"    # Your Bearer Token
 BASE_OUTPUT_DIR = "confluence_hierarchy_export"            # Output root folder
@@ -138,6 +138,7 @@ def process_images_and_attachments(url, page_id, headers, html_body, current_dir
     parsed_base = urllib.parse.urlparse(url)
     domain_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
+    # 1. Download all attachments first
     for att in attachments:
         filename = att['title']
         download_rel_path = att['_links']['download']
@@ -145,17 +146,25 @@ def process_images_and_attachments(url, page_id, headers, html_body, current_dir
         download_url = f"{domain_base}{download_rel_path}" if download_rel_path.startswith('/') else f"{url.rstrip('/')}/{download_rel_path}"
         local_filepath = os.path.join(img_folder, filename)
 
-        if download_attachment_stream(download_url, headers, local_filepath):
+        download_attachment_stream(download_url, headers, local_filepath)
+
+    # 2. Safely replace HTML tags sequentially to prevent text-swallowing
+    def replace_image_macro(match):
+        macro_block = match.group(0)
+        # Look for the filename ONLY inside this specific, isolated XML block
+        name_match = re.search(r'ri:filename="([^"]+)"', macro_block)
+        if name_match:
+            filename = name_match.group(1)
             encoded_filename = urllib.parse.quote(filename)
-            
-            escape_name = re.escape(filename)
-            pattern = r'<ac:image[^>]*>.*?ri:filename="' + escape_name + r'".*?</ac:image>'
-            html_img_tag = f'<img src="images/{encoded_filename}" width="500" alt="{filename}" />'
-            
-            html_body = re.sub(pattern, html_img_tag, html_body, flags=re.DOTALL | re.IGNORECASE)
+            return f'<img src="images/{encoded_filename}" width="500" alt="{filename}" />'
+        
+        return macro_block  # If no filename is found, leave the block alone
+
+    # This single regex pass stops at every </ac:image> closing tag, guaranteeing 
+    # it never accidentally consumes the text between images.
+    html_body = re.sub(r'<ac:image[^>]*>.*?</ac:image>', replace_image_macro, html_body, flags=re.DOTALL | re.IGNORECASE)
 
     return html_body
-
 
 def export_page_recursively(url, page_id, headers, parent_dir, depth=0):
     """Recursively processes a page and all its sub-pages."""
