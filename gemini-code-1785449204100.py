@@ -7,11 +7,10 @@ import requests
 import html2text
 
 # ==================== CONFIGURATION ====================
-CONFLUENCE_URL = "https://your-domain.atlassian.net/wiki"  # Base URL
+CONFLUENCE_URL = "https://orangesharing.com"               # Confirmed Base URL
 START_PAGE_IDS = ["123456789"]                             # List of top-level Page IDs
-EMAIL = "your-email@example.com"                           # Confluence account email
-API_TOKEN = "your-api-token-or-PAT"                        # API Token
-BASE_OUTPUT_DIR = "confluence_hierarchy_export"           # Output root folder
+PERSONAL_ACCESS_TOKEN = "your-generated-pat-token-here"    # Your Bearer Token
+BASE_OUTPUT_DIR = "confluence_hierarchy_export"            # Output root folder
 # =======================================================
 
 
@@ -21,18 +20,17 @@ def sanitize_name(name):
     return sanitized if sanitized else "Untitled_Page"
 
 
-def fetch_paginated_api(url, auth):
+def fetch_paginated_api(url, headers):
     """Fetches all items across paginated Confluence REST API endpoints."""
     results = []
     current_url = url
 
-    # Parse base domain for relative next links
     parsed_base = urllib.parse.urlparse(CONFLUENCE_URL)
     domain_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
     while current_url:
         try:
-            res = requests.get(current_url, auth=auth, timeout=15)
+            res = requests.get(current_url, headers=headers, timeout=15)
             if res.status_code != 200:
                 print(f"  [!] API Warning (HTTP {res.status_code}): {res.text}")
                 break
@@ -40,7 +38,6 @@ def fetch_paginated_api(url, auth):
             data = res.json()
             results.extend(data.get('results', []))
 
-            # Handle pagination link
             next_link = data.get('_links', {}).get('next')
             if next_link:
                 current_url = f"{domain_base}{next_link}" if next_link.startswith('/') else next_link
@@ -55,19 +52,19 @@ def fetch_paginated_api(url, auth):
     return results
 
 
-def verify_connection(url, page_id, auth):
+def verify_connection(url, page_id, headers):
     """Pre-flight check for network connectivity, auth, and page existence."""
     api_url = f"{url}/rest/api/content/{page_id}?expand=body.storage"
     
     try:
         print(f"[+] Testing connection to: {url}...")
-        res = requests.get(api_url, auth=auth, timeout=10)
+        res = requests.get(api_url, headers=headers, timeout=10)
 
         if res.status_code == 200:
             print("[✓] Connection & Authentication successful!\n")
             return True
         elif res.status_code == 401:
-            print("[X] Auth Error (401): Check your Email and API Token.")
+            print("[X] Auth Error (401): Check your Personal Access Token.")
         elif res.status_code == 403:
             print("[X] Permission Error (403): You do not have access to view this page/space.")
         elif res.status_code == 404:
@@ -88,7 +85,6 @@ def preprocess_confluence_html(html_body):
     if not html_body:
         return ""
 
-    # 1. Convert Confluence Code Macros to standard HTML <pre><code> blocks
     def code_macro_replacer(match):
         code_content = match.group(1)
         code_content = re.sub(r'<!\[CDATA\[(.*?)\]\]>', r'\1', code_content, flags=re.DOTALL)
@@ -101,7 +97,6 @@ def preprocess_confluence_html(html_body):
         flags=re.DOTALL
     )
 
-    # 2. Prevent breaks inside table cells from ruining Markdown tables
     def clean_table_breaks(match):
         table_content = match.group(0)
         return re.sub(r'<br\s*/?>', ' ', table_content, flags=re.IGNORECASE)
@@ -111,10 +106,10 @@ def preprocess_confluence_html(html_body):
     return html_body
 
 
-def download_attachment_stream(download_url, auth, target_path):
+def download_attachment_stream(download_url, headers, target_path):
     """Streams attachment download to disk."""
     try:
-        with requests.get(download_url, auth=auth, stream=True, timeout=20) as r:
+        with requests.get(download_url, headers=headers, stream=True, timeout=20) as r:
             if r.status_code == 200:
                 with open(target_path, 'wb') as f:
                     for chunk in r.iter_content(chunk_size=8192):
@@ -127,10 +122,10 @@ def download_attachment_stream(download_url, auth, target_path):
     return False
 
 
-def process_images_and_attachments(url, page_id, auth, html_body, current_dir):
+def process_images_and_attachments(url, page_id, headers, html_body, current_dir):
     """Downloads images and safely replaces Confluence XML image tags with standard HTML."""
     att_api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
-    attachments = fetch_paginated_api(att_api_url, auth)
+    attachments = fetch_paginated_api(att_api_url, headers)
 
     if not attachments:
         return html_body
@@ -140,7 +135,6 @@ def process_images_and_attachments(url, page_id, auth, html_body, current_dir):
 
     print(f"  └─ Found {len(attachments)} attached file(s). Downloading...")
 
-    # Extract base domain for proper attachment URL concatenation
     parsed_base = urllib.parse.urlparse(url)
     domain_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
@@ -148,14 +142,12 @@ def process_images_and_attachments(url, page_id, auth, html_body, current_dir):
         filename = att['title']
         download_rel_path = att['_links']['download']
         
-        # Build the exact, correct download URL 
         download_url = f"{domain_base}{download_rel_path}" if download_rel_path.startswith('/') else f"{url.rstrip('/')}/{download_rel_path}"
         local_filepath = os.path.join(img_folder, filename)
 
-        if download_attachment_stream(download_url, auth, local_filepath):
+        if download_attachment_stream(download_url, headers, local_filepath):
             encoded_filename = urllib.parse.quote(filename)
             
-            # Use Regex to replace the entire Confluence <ac:image> XML wrapper with a standard HTML <img>
             escape_name = re.escape(filename)
             pattern = r'<ac:image[^>]*>.*?ri:filename="' + escape_name + r'".*?</ac:image>'
             html_img_tag = f'<img src="images/{encoded_filename}" width="500" alt="{filename}" />'
@@ -165,13 +157,13 @@ def process_images_and_attachments(url, page_id, auth, html_body, current_dir):
     return html_body
 
 
-def export_page_recursively(url, page_id, auth, parent_dir, depth=0):
+def export_page_recursively(url, page_id, headers, parent_dir, depth=0):
     """Recursively processes a page and all its sub-pages."""
     indent = "  " * depth
     
     page_api_url = f"{url}/rest/api/content/{page_id}?expand=body.storage"
     try:
-        res = requests.get(page_api_url, auth=auth, timeout=15)
+        res = requests.get(page_api_url, headers=headers, timeout=15)
         if res.status_code != 200:
             print(f"{indent}[X] Error reading Page ID {page_id} (HTTP {res.status_code})")
             return
@@ -181,7 +173,6 @@ def export_page_recursively(url, page_id, auth, parent_dir, depth=0):
         return
 
     title = data.get('title', 'Untitled')
-    # Default to empty string if body is empty or None
     raw_html = data.get('body', {}).get('storage', {}).get('value', '') or ''
     clean_title = sanitize_name(title)
 
@@ -191,7 +182,7 @@ def export_page_recursively(url, page_id, auth, parent_dir, depth=0):
     print(f"{indent}[+] ({page_id}) Exporting: '{title}'")
 
     preprocessed_html = preprocess_confluence_html(raw_html)
-    updated_html = process_images_and_attachments(url, page_id, auth, preprocessed_html, current_dir)
+    updated_html = process_images_and_attachments(url, page_id, headers, preprocessed_html, current_dir)
 
     h = html2text.HTML2Text()
     h.body_width = 0           
@@ -208,25 +199,29 @@ def export_page_recursively(url, page_id, auth, parent_dir, depth=0):
     time.sleep(0.2)
 
     children_api_url = f"{url}/rest/api/content/{page_id}/child/page"
-    child_pages = fetch_paginated_api(children_api_url, auth)
+    child_pages = fetch_paginated_api(children_api_url, headers)
 
     if child_pages:
         print(f"{indent}  └─ Found {len(child_pages)} sub-page(s). Traversing deeper...")
         for child in child_pages:
-            export_page_recursively(url, child['id'], auth, current_dir, depth + 1)
+            export_page_recursively(url, child['id'], headers, current_dir, depth + 1)
 
 
 def main():
-    auth = (EMAIL, API_TOKEN)
+    # Set up the Bearer Token Header for authentication
+    headers = {
+        "Authorization": f"Bearer {PERSONAL_ACCESS_TOKEN}",
+        "Accept": "application/json"
+    }
     
-    if not START_PAGE_IDS or not verify_connection(CONFLUENCE_URL, START_PAGE_IDS[0], auth):
+    if not START_PAGE_IDS or not verify_connection(CONFLUENCE_URL, START_PAGE_IDS[0], headers):
         sys.exit(1)
 
     os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
     print(f"[=== Starting Hierarchical Confluence Export ===]\n")
 
     for start_id in START_PAGE_IDS:
-        export_page_recursively(CONFLUENCE_URL, start_id, auth, BASE_OUTPUT_DIR)
+        export_page_recursively(CONFLUENCE_URL, start_id, headers, BASE_OUTPUT_DIR)
 
     print(f"\n[✓] Complete! All pages exported to: '{BASE_OUTPUT_DIR}'")
 
