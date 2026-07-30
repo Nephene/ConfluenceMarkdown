@@ -7,7 +7,7 @@ import requests
 import html2text
 
 # ==================== CONFIGURATION ====================
-CONFLUENCE_URL = "http"               # Confirmed Base URL
+CONFLUENCE_URL = "https://.com"               # Your custom Base URL
 START_PAGE_IDS = ["123456789"]                             # List of top-level Page IDs
 PERSONAL_ACCESS_TOKEN = "your-generated-pat-token-here"    # Your Bearer Token
 BASE_OUTPUT_DIR = "confluence_hierarchy_export"            # Output root folder
@@ -121,15 +121,15 @@ def download_attachment_stream(download_url, headers, target_path):
         print(f"  [!] Error streaming attachment: {e}")
     return False
 
-def process_images_and_attachments(url, page_id, headers, html_body, target_dir, img_dir_name):
-    """Downloads images to an isolated directory and rewrites HTML tags."""
+
+def process_images_and_attachments(url, page_id, headers, html_body, target_dir, img_dir_name, image_map):
+    """Downloads images and hides them behind placeholders to protect HTML tags from the parser."""
     att_api_url = f"{url}/rest/api/content/{page_id}/child/attachment"
     attachments = fetch_paginated_api(att_api_url, headers)
 
     if not attachments:
         return html_body
 
-    # Use the dynamic image directory name (e.g. 'images' or 'PageName_images')
     img_folder = os.path.join(target_dir, img_dir_name)
     os.makedirs(img_folder, exist_ok=True)
 
@@ -138,6 +138,7 @@ def process_images_and_attachments(url, page_id, headers, html_body, target_dir,
     parsed_base = urllib.parse.urlparse(url)
     domain_base = f"{parsed_base.scheme}://{parsed_base.netloc}"
 
+    # 1. Download all attachments first
     for att in attachments:
         filename = att['title']
         download_rel_path = att['_links']['download']
@@ -147,14 +148,23 @@ def process_images_and_attachments(url, page_id, headers, html_body, target_dir,
 
         download_attachment_stream(download_url, headers, local_filepath)
 
+    # 2. Safely replace HTML tags with placeholders
     def replace_image_macro(match):
         macro_block = match.group(0)
         name_match = re.search(r'ri:filename="([^"]+)"', macro_block)
+        
         if name_match:
             filename = name_match.group(1)
             encoded_filename = urllib.parse.quote(filename)
-            # Route the src to the correct dynamic image folder
-            return f'<img src="{img_dir_name}/{encoded_filename}" width="500" alt="{filename}" />'
+            
+            # The exact HTML we want in the final Markdown
+            final_html_tag = f'<br><img src="{img_dir_name}/{encoded_filename}" width="500" alt="{filename}" /><br>'
+            
+            # Create a safe alphanumeric placeholder html2text won't touch
+            placeholder = f"IMGPLACEHOLDERXYZ{len(image_map)}"
+            image_map[placeholder] = final_html_tag
+            
+            return placeholder
         
         return macro_block
 
@@ -193,22 +203,21 @@ def export_page_recursively(url, page_id, headers, parent_dir, depth=0):
 
     # 3. Configure folder and file naming based on page type
     if is_landing_page:
-        # It has sub-pages -> Create a directory, name it index.md
         target_dir = os.path.join(parent_dir, clean_title)
         os.makedirs(target_dir, exist_ok=True)
         md_filename = "index.md"
         img_dir_name = "images"
         recursion_dir = target_dir
     else:
-        # No sub-pages -> Stays in parent directory, uses its own name
         target_dir = parent_dir
         md_filename = f"{clean_title}.md"
         img_dir_name = f"{clean_title}_images"
         recursion_dir = target_dir
 
-    # 4. Process Images and HTML
+    # 4. Process Images and HTML (Using the Placeholder Map)
+    image_map = {}
     preprocessed_html = preprocess_confluence_html(raw_html)
-    updated_html = process_images_and_attachments(url, page_id, headers, preprocessed_html, target_dir, img_dir_name)
+    updated_html = process_images_and_attachments(url, page_id, headers, preprocessed_html, target_dir, img_dir_name, image_map)
 
     h = html2text.HTML2Text()
     h.body_width = 0           
@@ -216,15 +225,12 @@ def export_page_recursively(url, page_id, headers, parent_dir, depth=0):
     h.ignore_images = False    
     h.ignore_tables = False    
 
+    # Convert to Markdown
     md_content = h.handle(updated_html)
 
-    # Convert standard Markdown images back to HTML tags to enforce width limits
-    # Uses dynamic regex to match whichever image folder name was assigned
-    md_content = re.sub(
-        r'!\[(.*?)\]\((' + re.escape(img_dir_name) + r'/[^\)]+)\)', 
-        r'<img src="\2" width="500" alt="\1" />', 
-        md_content
-    )
+    # Restore the perfect HTML images from our placeholders!
+    for placeholder, html_tag in image_map.items():
+        md_content = md_content.replace(placeholder, html_tag)
 
     # 5. Save the Markdown File
     md_filepath = os.path.join(target_dir, md_filename)
@@ -239,6 +245,7 @@ def export_page_recursively(url, page_id, headers, parent_dir, depth=0):
         for child in child_pages:
             export_page_recursively(url, child['id'], headers, recursion_dir, depth + 1)
             
+
 def main():
     # Set up the Bearer Token Header for authentication
     headers = {
